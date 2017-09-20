@@ -646,6 +646,9 @@ static int enable_debounce(struct gpio_chip *chip, unsigned int offset,
 	int rc;
 	int i;
 
+	if (!gpio->clk)
+		return -EINVAL;
+
 	rc = usecs_to_cycles(gpio, usecs, &requested_cycles);
 	if (rc < 0) {
 		dev_warn(chip->parent, "Failed to convert %luus to cycles at %luHz: %d\n",
@@ -831,7 +834,7 @@ static int __init aspeed_gpio_probe(struct platform_device *pdev)
 	gpio->clk = of_clk_get(pdev->dev.of_node, 0);
 	if (IS_ERR(gpio->clk)) {
 		dev_warn(&pdev->dev,
-				"No HPLL clock phandle provided, debouncing disabled\n");
+				"Failed to get clock from devicetree, debouncing disabled\n");
 		gpio->clk = NULL;
 	}
 

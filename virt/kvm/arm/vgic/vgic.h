@@ -111,14 +111,18 @@ static inline bool irq_is_pending(struct vgic_irq *irq)
  * registers regardless of the hardware backed GIC used.
  */
 struct vgic_vmcr {
-	u32	ctlr;
+	u32	grpen0;
+	u32	grpen1;
+
+	u32	ackctl;
+	u32	fiqen;
+	u32	cbpr;
+	u32	eoim;
+
 	u32	abpr;
 	u32	bpr;
 	u32	pmr;  /* Priority mask field in the GICC_PMR and
 		       * ICC_PMR_EL1 priority field format */
-	/* Below member variable are valid only for GICv3 */
-	u32	grpen0;
-	u32	grpen1;
 };
 
 struct vgic_reg_attr {
@@ -215,5 +219,21 @@ int vgic_debug_destroy(struct kvm *kvm);
 
 bool lock_all_vcpus(struct kvm *kvm);
 void unlock_all_vcpus(struct kvm *kvm);
+
+static inline int vgic_v3_max_apr_idx(struct kvm_vcpu *vcpu)
+{
+	struct vgic_cpu *cpu_if = &vcpu->arch.vgic_cpu;
+
+	/*
+	 * num_pri_bits are initialized with HW supported values.
+	 * We can rely safely on num_pri_bits even if VM has not
+	 * restored ICC_CTLR_EL1 before restoring APnR registers.
+	 */
+	switch (cpu_if->num_pri_bits) {
+	case 7: return 3;
+	case 6: return 1;
+	default: return 0;
+	}
+}
 
 #endif
