@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Generate definitions needed by assembly language modules.
  * This code generates raw asm output which is post-processed to extract
@@ -92,4 +93,10 @@ void common(void) {
 
 	BLANK();
 	DEFINE(PTREGS_SIZE, sizeof(struct pt_regs));
+
+	/* Layout info for cpu_entry_area */
+	OFFSET(CPU_ENTRY_AREA_tss, cpu_entry_area, tss);
+	OFFSET(CPU_ENTRY_AREA_entry_trampoline, cpu_entry_area, entry_trampoline);
+	OFFSET(CPU_ENTRY_AREA_SYSENTER_stack, cpu_entry_area, SYSENTER_stack_page);
+	DEFINE(SIZEOF_SYSENTER_stack, sizeof(struct SYSENTER_stack));
 }

@@ -439,7 +439,7 @@ assemble_neg_contexts(struct smb2_negotiate_req *req)
 	build_encrypt_ctxt((struct smb2_encryption_neg_context *)pneg_ctxt);
 	req->NegotiateContextOffset = cpu_to_le32(OFFSET_OF_NEG_CONTEXT);
 	req->NegotiateContextCount = cpu_to_le16(2);
-	inc_rfc1001_len(req, 4 + sizeof(struct smb2_preauth_neg_context) + 2
+	inc_rfc1001_len(req, 4 + sizeof(struct smb2_preauth_neg_context)
 			+ sizeof(struct smb2_encryption_neg_context)); /* calculate hash */
 }
 #else
@@ -570,10 +570,11 @@ SMB2_negotiate(const unsigned int xid, struct cifs_ses *ses)
 			/* ops set to 3.0 by default for default so update */
 			ses->server->ops = &smb21_operations;
 		}
-	} else if (rsp->DialectRevision != ses->server->vals->protocol_id) {
+	} else if (le16_to_cpu(rsp->DialectRevision) !=
+				ses->server->vals->protocol_id) {
 		/* if requested single dialect ensure returned dialect matched */
 		cifs_dbg(VFS, "Illegal 0x%x dialect returned: not requested\n",
-			cpu_to_le16(rsp->DialectRevision));
+			le16_to_cpu(rsp->DialectRevision));
 		return -EIO;
 	}
 
@@ -647,7 +648,7 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 {
 	int rc = 0;
 	struct validate_negotiate_info_req vneg_inbuf;
-	struct validate_negotiate_info_rsp *pneg_rsp;
+	struct validate_negotiate_info_rsp *pneg_rsp = NULL;
 	u32 rsplen;
 	u32 inbuflen; /* max of 4 dialects */
 
@@ -655,14 +656,21 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 
 	/*
 	 * validation ioctl must be signed, so no point sending this if we
-	 * can not sign it.  We could eventually change this to selectively
+	 * can not sign it (ie are not known user).  Even if signing is not
+	 * required (enabled but not negotiated), in those cases we selectively
 	 * sign just this, the first and only signed request on a connection.
-	 * This is good enough for now since a user who wants better security
-	 * would also enable signing on the mount. Having validation of
-	 * negotiate info for signed connections helps reduce attack vectors
+	 * Having validation of negotiate info  helps reduce attack vectors.
 	 */
-	if (tcon->ses->server->sign == false)
+	if (tcon->ses->session_flags & SMB2_SESSION_FLAG_IS_GUEST)
 		return 0; /* validation requires signing */
+
+	if (tcon->ses->user_name == NULL) {
+		cifs_dbg(FYI, "Can't validate negotiate: null user mount\n");
+		return 0; /* validation requires signing */
+	}
+
+	if (tcon->ses->session_flags & SMB2_SESSION_FLAG_IS_NULL)
+		cifs_dbg(VFS, "Unexpected null user (anonymous) auth flag sent by server\n");
 
 	vneg_inbuf.Capabilities =
 			cpu_to_le32(tcon->ses->server->vals->req_capabilities);
@@ -719,8 +727,9 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 			 rsplen);
 
 		/* relax check since Mac returns max bufsize allowed on ioctl */
-		if (rsplen > CIFSMaxBufSize)
-			return -EIO;
+		if ((rsplen > CIFSMaxBufSize)
+		     || (rsplen < sizeof(struct validate_negotiate_info_rsp)))
+			goto err_rsp_free;
 	}
 
 	/* check validate negotiate info response matches what we got earlier */
@@ -739,10 +748,13 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
 
 	/* validate negotiate successful */
 	cifs_dbg(FYI, "validate negotiate info successful\n");
+	kfree(pneg_rsp);
 	return 0;
 
 vneg_out:
 	cifs_dbg(VFS, "protocol revalidation - security settings mismatch\n");
+err_rsp_free:
+	kfree(pneg_rsp);
 	return -EIO;
 }
 
@@ -1175,6 +1187,8 @@ SMB2_sess_setup(const unsigned int xid, struct cifs_ses *ses,
 	while (sess_data->func)
 		sess_data->func(sess_data);
 
+	if ((ses->session_flags & SMB2_SESSION_FLAG_IS_GUEST) && (ses->sign))
+		cifs_dbg(VFS, "signing requested but authenticated as guest\n");
 	rc = sess_data->result;
 out:
 	kfree(sess_data);
@@ -1245,7 +1259,7 @@ SMB2_tcon(const unsigned int xid, struct cifs_ses *ses, const char *tree,
 	struct smb2_tree_connect_req *req;
 	struct smb2_tree_connect_rsp *rsp = NULL;
 	struct kvec iov[2];
-	struct kvec rsp_iov;
+	struct kvec rsp_iov = { NULL, 0 };
 	int rc = 0;
 	int resp_buftype;
 	int unc_path_len;
@@ -1362,7 +1376,7 @@ tcon_exit:
 	return rc;
 
 tcon_error_exit:
-	if (rsp->hdr.sync_hdr.Status == STATUS_BAD_NETWORK_NAME) {
+	if (rsp && rsp->hdr.sync_hdr.Status == STATUS_BAD_NETWORK_NAME) {
 		cifs_dbg(VFS, "BAD_NETWORK_NAME: %s\n", tree);
 	}
 	goto tcon_exit;
@@ -1965,6 +1979,9 @@ SMB2_ioctl(const unsigned int xid, struct cifs_tcon *tcon, u64 persistent_fid,
 	} else
 		iov[0].iov_len = get_rfc1002_length(req) + 4;
 
+	/* validate negotiate request must be signed - see MS-SMB2 3.2.5.5 */
+	if (opcode == FSCTL_VALIDATE_NEGOTIATE_INFO)
+		req->hdr.sync_hdr.Flags |= SMB2_FLAGS_SIGNED;
 
 	rc = SendReceive2(xid, ses, iov, n_iov, &resp_buftype, flags, &rsp_iov);
 	cifs_small_buf_release(req);
@@ -2181,9 +2198,13 @@ query_info(const unsigned int xid, struct cifs_tcon *tcon,
 	req->PersistentFileId = persistent_fid;
 	req->VolatileFileId = volatile_fid;
 	req->AdditionalInformation = cpu_to_le32(additional_info);
-	/* 4 for rfc1002 length field and 1 for Buffer */
-	req->InputBufferOffset =
-		cpu_to_le16(sizeof(struct smb2_query_info_req) - 1 - 4);
+
+	/*
+	 * We do not use the input buffer (do not send extra byte)
+	 */
+	req->InputBufferOffset = 0;
+	inc_rfc1001_len(req, -1);
+
 	req->OutputBufferLength = cpu_to_le32(output_len);
 
 	iov[0].iov_base = (char *)req;
@@ -2223,12 +2244,12 @@ qinf_exit:
 }
 
 int SMB2_query_eas(const unsigned int xid, struct cifs_tcon *tcon,
-	u64 persistent_fid, u64 volatile_fid,
-	struct smb2_file_full_ea_info *data)
+		   u64 persistent_fid, u64 volatile_fid,
+		   int ea_buf_size, struct smb2_file_full_ea_info *data)
 {
 	return query_info(xid, tcon, persistent_fid, volatile_fid,
 			  FILE_FULL_EA_INFORMATION, SMB2_O_INFO_FILE, 0,
-			  SMB2_MAX_EA_BUF,
+			  ea_buf_size,
 			  sizeof(struct smb2_file_full_ea_info),
 			  (void **)&data,
 			  NULL);
@@ -2657,26 +2678,26 @@ SMB2_read(const unsigned int xid, struct cifs_io_parms *io_parms,
 	cifs_small_buf_release(req);
 
 	rsp = (struct smb2_read_rsp *)rsp_iov.iov_base;
-	shdr = get_sync_hdr(rsp);
-
-	if (shdr->Status == STATUS_END_OF_FILE) {
-		free_rsp_buf(resp_buftype, rsp_iov.iov_base);
-		return 0;
-	}
 
 	if (rc) {
-		cifs_stats_fail_inc(io_parms->tcon, SMB2_READ_HE);
-		cifs_dbg(VFS, "Send error in read = %d\n", rc);
-	} else {
-		*nbytes = le32_to_cpu(rsp->DataLength);
-		if ((*nbytes > CIFS_MAX_MSGSIZE) ||
-		    (*nbytes > io_parms->length)) {
-			cifs_dbg(FYI, "bad length %d for count %d\n",
-				 *nbytes, io_parms->length);
-			rc = -EIO;
-			*nbytes = 0;
+		if (rc != -ENODATA) {
+			cifs_stats_fail_inc(io_parms->tcon, SMB2_READ_HE);
+			cifs_dbg(VFS, "Send error in read = %d\n", rc);
 		}
+		free_rsp_buf(resp_buftype, rsp_iov.iov_base);
+		return rc == -ENODATA ? 0 : rc;
 	}
+
+	*nbytes = le32_to_cpu(rsp->DataLength);
+	if ((*nbytes > CIFS_MAX_MSGSIZE) ||
+	    (*nbytes > io_parms->length)) {
+		cifs_dbg(FYI, "bad length %d for count %d\n",
+			 *nbytes, io_parms->length);
+		rc = -EIO;
+		*nbytes = 0;
+	}
+
+	shdr = get_sync_hdr(rsp);
 
 	if (*buf) {
 		memcpy(*buf, (char *)shdr + rsp->DataOffset, *nbytes);

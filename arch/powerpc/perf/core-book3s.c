@@ -793,6 +793,11 @@ void perf_event_print_debug(void)
 	u32 pmcs[MAX_HWEVENTS];
 	int i;
 
+	if (!ppmu) {
+		pr_info("Performance monitor hardware not registered.\n");
+		return;
+	}
+
 	if (!ppmu->n_counter)
 		return;
 
@@ -1410,7 +1415,7 @@ static int collect_events(struct perf_event *group, int max_count,
 	int n = 0;
 	struct perf_event *event;
 
-	if (!is_software_event(group)) {
+	if (group->pmu->task_ctx_nr == perf_hw_context) {
 		if (n >= max_count)
 			return -1;
 		ctrs[n] = group;
@@ -1418,7 +1423,7 @@ static int collect_events(struct perf_event *group, int max_count,
 		events[n++] = group->hw.config;
 	}
 	list_for_each_entry(event, &group->sibling_list, group_entry) {
-		if (!is_software_event(event) &&
+		if (event->pmu->task_ctx_nr == perf_hw_context &&
 		    event->state != PERF_EVENT_STATE_OFF) {
 			if (n >= max_count)
 				return -1;
