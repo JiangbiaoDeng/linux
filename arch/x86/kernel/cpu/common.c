@@ -47,6 +47,8 @@
 #include <asm/pat.h>
 #include <asm/microcode.h>
 #include <asm/microcode_intel.h>
+#include <asm/intel-family.h>
+#include <asm/cpu_device_id.h>
 
 #ifdef CONFIG_X86_LOCAL_APIC
 #include <asm/uv/uv.h>
@@ -506,101 +508,7 @@ static const unsigned int exception_stack_sizes[N_EXCEPTION_STACKS] = {
 	  [0 ... N_EXCEPTION_STACKS - 1]	= EXCEPTION_STKSZ,
 	  [DEBUG_STACK - 1]			= DEBUG_STKSZ
 };
-
-static DEFINE_PER_CPU_PAGE_ALIGNED(char, exception_stacks
-	[(N_EXCEPTION_STACKS - 1) * EXCEPTION_STKSZ + DEBUG_STKSZ]);
 #endif
-
-static DEFINE_PER_CPU_PAGE_ALIGNED(struct SYSENTER_stack_page,
-				   SYSENTER_stack_storage);
-
-static void __init
-set_percpu_fixmap_pages(int idx, void *ptr, int pages, pgprot_t prot)
-{
-	for ( ; pages; pages--, idx--, ptr += PAGE_SIZE)
-		__set_fixmap(idx, per_cpu_ptr_to_phys(ptr), prot);
-}
-
-/* Setup the fixmap mappings only once per-processor */
-static void __init setup_cpu_entry_area(int cpu)
-{
-#ifdef CONFIG_X86_64
-	extern char _entry_trampoline[];
-
-	/* On 64-bit systems, we use a read-only fixmap GDT and TSS. */
-	pgprot_t gdt_prot = PAGE_KERNEL_RO;
-	pgprot_t tss_prot = PAGE_KERNEL_RO;
-#else
-	/*
-	 * On native 32-bit systems, the GDT cannot be read-only because
-	 * our double fault handler uses a task gate, and entering through
-	 * a task gate needs to change an available TSS to busy.  If the
-	 * GDT is read-only, that will triple fault.  The TSS cannot be
-	 * read-only because the CPU writes to it on task switches.
-	 *
-	 * On Xen PV, the GDT must be read-only because the hypervisor
-	 * requires it.
-	 */
-	pgprot_t gdt_prot = boot_cpu_has(X86_FEATURE_XENPV) ?
-		PAGE_KERNEL_RO : PAGE_KERNEL;
-	pgprot_t tss_prot = PAGE_KERNEL;
-#endif
-
-	__set_fixmap(get_cpu_entry_area_index(cpu, gdt), get_cpu_gdt_paddr(cpu), gdt_prot);
-	set_percpu_fixmap_pages(get_cpu_entry_area_index(cpu, SYSENTER_stack_page),
-				per_cpu_ptr(&SYSENTER_stack_storage, cpu), 1,
-				PAGE_KERNEL);
-
-	/*
-	 * The Intel SDM says (Volume 3, 7.2.1):
-	 *
-	 *  Avoid placing a page boundary in the part of the TSS that the
-	 *  processor reads during a task switch (the first 104 bytes). The
-	 *  processor may not correctly perform address translations if a
-	 *  boundary occurs in this area. During a task switch, the processor
-	 *  reads and writes into the first 104 bytes of each TSS (using
-	 *  contiguous physical addresses beginning with the physical address
-	 *  of the first byte of the TSS). So, after TSS access begins, if
-	 *  part of the 104 bytes is not physically contiguous, the processor
-	 *  will access incorrect information without generating a page-fault
-	 *  exception.
-	 *
-	 * There are also a lot of errata involving the TSS spanning a page
-	 * boundary.  Assert that we're not doing that.
-	 */
-	BUILD_BUG_ON((offsetof(struct tss_struct, x86_tss) ^
-		      offsetofend(struct tss_struct, x86_tss)) & PAGE_MASK);
-	BUILD_BUG_ON(sizeof(struct tss_struct) % PAGE_SIZE != 0);
-	set_percpu_fixmap_pages(get_cpu_entry_area_index(cpu, tss),
-				&per_cpu(cpu_tss_rw, cpu),
-				sizeof(struct tss_struct) / PAGE_SIZE,
-				tss_prot);
-
-#ifdef CONFIG_X86_32
-	per_cpu(cpu_entry_area, cpu) = get_cpu_entry_area(cpu);
-#endif
-
-#ifdef CONFIG_X86_64
-	BUILD_BUG_ON(sizeof(exception_stacks) % PAGE_SIZE != 0);
-	BUILD_BUG_ON(sizeof(exception_stacks) !=
-		     sizeof(((struct cpu_entry_area *)0)->exception_stacks));
-	set_percpu_fixmap_pages(get_cpu_entry_area_index(cpu, exception_stacks),
-				&per_cpu(exception_stacks, cpu),
-				sizeof(exception_stacks) / PAGE_SIZE,
-				PAGE_KERNEL);
-
-	__set_fixmap(get_cpu_entry_area_index(cpu, entry_trampoline),
-		     __pa_symbol(_entry_trampoline), PAGE_KERNEL_RX);
-#endif
-}
-
-void __init setup_cpu_entry_areas(void)
-{
-	unsigned int cpu;
-
-	for_each_possible_cpu(cpu)
-		setup_cpu_entry_area(cpu);
-}
 
 /* Load the original GDT from the per-cpu structure */
 void load_direct_gdt(int cpu)
@@ -823,7 +731,7 @@ void cpu_detect(struct cpuinfo_x86 *c)
 		cpuid(0x00000001, &tfms, &misc, &junk, &cap0);
 		c->x86		= x86_family(tfms);
 		c->x86_model	= x86_model(tfms);
-		c->x86_mask	= x86_stepping(tfms);
+		c->x86_stepping	= x86_stepping(tfms);
 
 		if (cap0 & (1<<19)) {
 			c->x86_clflush_size = ((misc >> 8) & 0xff) * 8;
@@ -840,6 +748,26 @@ static void apply_forced_caps(struct cpuinfo_x86 *c)
 		c->x86_capability[i] &= ~cpu_caps_cleared[i];
 		c->x86_capability[i] |= cpu_caps_set[i];
 	}
+}
+
+static void init_speculation_control(struct cpuinfo_x86 *c)
+{
+	/*
+	 * The Intel SPEC_CTRL CPUID bit implies IBRS and IBPB support,
+	 * and they also have a different bit for STIBP support. Also,
+	 * a hypervisor might have set the individual AMD bits even on
+	 * Intel CPUs, for finer-grained selection of what's available.
+	 *
+	 * We use the AMD bits in 0x8000_0008 EBX as the generic hardware
+	 * features, which are visible in /proc/cpuinfo and used by the
+	 * kernel. So set those accordingly from the Intel bits.
+	 */
+	if (cpu_has(c, X86_FEATURE_SPEC_CTRL)) {
+		set_cpu_cap(c, X86_FEATURE_IBRS);
+		set_cpu_cap(c, X86_FEATURE_IBPB);
+	}
+	if (cpu_has(c, X86_FEATURE_INTEL_STIBP))
+		set_cpu_cap(c, X86_FEATURE_STIBP);
 }
 
 void get_cpu_cap(struct cpuinfo_x86 *c)
@@ -863,6 +791,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 		cpuid_count(0x00000007, 0, &eax, &ebx, &ecx, &edx);
 		c->x86_capability[CPUID_7_0_EBX] = ebx;
 		c->x86_capability[CPUID_7_ECX] = ecx;
+		c->x86_capability[CPUID_7_EDX] = edx;
 	}
 
 	/* Extended state features: level 0x0000000d */
@@ -935,6 +864,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 		c->x86_capability[CPUID_8000_000A_EDX] = cpuid_edx(0x8000000a);
 
 	init_scattered_cpuid_features(c);
+	init_speculation_control(c);
 
 	/*
 	 * Clear/Set all flags overridden by options, after probe.
@@ -968,6 +898,41 @@ static void identify_cpu_without_cpuid(struct cpuinfo_x86 *c)
 			}
 		}
 #endif
+}
+
+static const __initconst struct x86_cpu_id cpu_no_speculation[] = {
+	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CEDARVIEW,	X86_FEATURE_ANY },
+	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_CLOVERVIEW,	X86_FEATURE_ANY },
+	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_LINCROFT,	X86_FEATURE_ANY },
+	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PENWELL,	X86_FEATURE_ANY },
+	{ X86_VENDOR_INTEL,	6, INTEL_FAM6_ATOM_PINEVIEW,	X86_FEATURE_ANY },
+	{ X86_VENDOR_CENTAUR,	5 },
+	{ X86_VENDOR_INTEL,	5 },
+	{ X86_VENDOR_NSC,	5 },
+	{ X86_VENDOR_ANY,	4 },
+	{}
+};
+
+static const __initconst struct x86_cpu_id cpu_no_meltdown[] = {
+	{ X86_VENDOR_AMD },
+	{}
+};
+
+static bool __init cpu_vulnerable_to_meltdown(struct cpuinfo_x86 *c)
+{
+	u64 ia32_cap = 0;
+
+	if (x86_match_cpu(cpu_no_meltdown))
+		return false;
+
+	if (cpu_has(c, X86_FEATURE_ARCH_CAPABILITIES))
+		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, ia32_cap);
+
+	/* Rogue Data Cache Load? No! */
+	if (ia32_cap & ARCH_CAP_RDCL_NO)
+		return false;
+
+	return true;
 }
 
 /*
@@ -1016,6 +981,14 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
 	}
 
 	setup_force_cpu_cap(X86_FEATURE_ALWAYS);
+
+	if (!x86_match_cpu(cpu_no_speculation)) {
+		if (cpu_vulnerable_to_meltdown(c))
+			setup_force_cpu_bug(X86_BUG_CPU_MELTDOWN);
+		setup_force_cpu_bug(X86_BUG_SPECTRE_V1);
+		setup_force_cpu_bug(X86_BUG_SPECTRE_V2);
+	}
+
 	fpu__init_system(c);
 
 #ifdef CONFIG_X86_32
@@ -1211,9 +1184,9 @@ static void identify_cpu(struct cpuinfo_x86 *c)
 	int i;
 
 	c->loops_per_jiffy = loops_per_jiffy;
-	c->x86_cache_size = -1;
+	c->x86_cache_size = 0;
 	c->x86_vendor = X86_VENDOR_UNKNOWN;
-	c->x86_model = c->x86_mask = 0;	/* So far unknown... */
+	c->x86_model = c->x86_stepping = 0;	/* So far unknown... */
 	c->x86_vendor_id[0] = '\0'; /* Unset */
 	c->x86_model_id[0] = '\0';  /* Unset */
 	c->x86_max_cores = 1;
@@ -1348,7 +1321,7 @@ void enable_sep_cpu(void)
 
 	tss->x86_tss.ss1 = __KERNEL_CS;
 	wrmsr(MSR_IA32_SYSENTER_CS, tss->x86_tss.ss1, 0);
-	wrmsr(MSR_IA32_SYSENTER_ESP, (unsigned long)(cpu_SYSENTER_stack(cpu) + 1), 0);
+	wrmsr(MSR_IA32_SYSENTER_ESP, (unsigned long)(cpu_entry_stack(cpu) + 1), 0);
 	wrmsr(MSR_IA32_SYSENTER_EIP, (unsigned long)entry_SYSENTER_32, 0);
 
 	put_cpu();
@@ -1405,8 +1378,8 @@ void print_cpu_info(struct cpuinfo_x86 *c)
 
 	pr_cont(" (family: 0x%x, model: 0x%x", c->x86, c->x86_model);
 
-	if (c->x86_mask || c->cpuid_level >= 0)
-		pr_cont(", stepping: 0x%x)\n", c->x86_mask);
+	if (c->x86_stepping || c->cpuid_level >= 0)
+		pr_cont(", stepping: 0x%x)\n", c->x86_stepping);
 	else
 		pr_cont(")\n");
 }
@@ -1454,7 +1427,10 @@ void syscall_init(void)
 		(entry_SYSCALL_64_trampoline - _entry_trampoline);
 
 	wrmsr(MSR_STAR, 0, (__USER32_CS << 16) | __KERNEL_CS);
-	wrmsrl(MSR_LSTAR, SYSCALL64_entry_trampoline);
+	if (static_cpu_has(X86_FEATURE_PTI))
+		wrmsrl(MSR_LSTAR, SYSCALL64_entry_trampoline);
+	else
+		wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
 
 #ifdef CONFIG_IA32_EMULATION
 	wrmsrl(MSR_CSTAR, (unsigned long)entry_SYSCALL_compat);
@@ -1465,7 +1441,7 @@ void syscall_init(void)
 	 * AMD doesn't allow SYSENTER in long mode (either 32- or 64-bit).
 	 */
 	wrmsrl_safe(MSR_IA32_SYSENTER_CS, (u64)__KERNEL_CS);
-	wrmsrl_safe(MSR_IA32_SYSENTER_ESP, (unsigned long)(cpu_SYSENTER_stack(cpu) + 1));
+	wrmsrl_safe(MSR_IA32_SYSENTER_ESP, (unsigned long)(cpu_entry_stack(cpu) + 1));
 	wrmsrl_safe(MSR_IA32_SYSENTER_EIP, (u64)entry_SYSENTER_compat);
 #else
 	wrmsrl(MSR_CSTAR, (unsigned long)ignore_sysret);
@@ -1680,7 +1656,7 @@ void cpu_init(void)
 	 */
 	set_tss_desc(cpu, &get_cpu_entry_area(cpu)->tss.x86_tss);
 	load_TR_desc();
-	load_sp0((unsigned long)(cpu_SYSENTER_stack(cpu) + 1));
+	load_sp0((unsigned long)(cpu_entry_stack(cpu) + 1));
 
 	load_mm_ldt(&init_mm);
 
@@ -1773,3 +1749,33 @@ static int __init init_cpu_syscore(void)
 	return 0;
 }
 core_initcall(init_cpu_syscore);
+
+/*
+ * The microcode loader calls this upon late microcode load to recheck features,
+ * only when microcode has been updated. Caller holds microcode_mutex and CPU
+ * hotplug lock.
+ */
+void microcode_check(void)
+{
+	struct cpuinfo_x86 info;
+
+	perf_check_microcode();
+
+	/* Reload CPUID max function as it might've changed. */
+	info.cpuid_level = cpuid_eax(0);
+
+	/*
+	 * Copy all capability leafs to pick up the synthetic ones so that
+	 * memcmp() below doesn't fail on that. The ones coming from CPUID will
+	 * get overwritten in get_cpu_cap().
+	 */
+	memcpy(&info.x86_capability, &boot_cpu_data.x86_capability, sizeof(info.x86_capability));
+
+	get_cpu_cap(&info);
+
+	if (!memcmp(&info.x86_capability, &boot_cpu_data.x86_capability, sizeof(info.x86_capability)))
+		return;
+
+	pr_warn("x86/CPU: CPU features have changed after loading microcode, but might not take effect.\n");
+	pr_warn("x86/CPU: Please consider either early loading through initrd/built-in or a potential BIOS update.\n");
+}
