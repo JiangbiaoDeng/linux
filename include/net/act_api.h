@@ -13,7 +13,7 @@
 #include <net/netns/generic.h>
 
 struct tcf_idrinfo {
-	spinlock_t	lock;
+	struct mutex	lock;
 	struct idr	action_idr;
 };
 
@@ -23,28 +23,27 @@ struct tc_action {
 	const struct tc_action_ops	*ops;
 	__u32				type; /* for backward compat(TCA_OLD_COMPAT) */
 	__u32				order;
-	struct list_head		list;
 	struct tcf_idrinfo		*idrinfo;
 
 	u32				tcfa_index;
 	refcount_t			tcfa_refcnt;
 	atomic_t			tcfa_bindcnt;
-	u32				tcfa_capab;
 	int				tcfa_action;
 	struct tcf_t			tcfa_tm;
 	struct gnet_stats_basic_packed	tcfa_bstats;
+	struct gnet_stats_basic_packed	tcfa_bstats_hw;
 	struct gnet_stats_queue		tcfa_qstats;
 	struct net_rate_estimator __rcu *tcfa_rate_est;
 	spinlock_t			tcfa_lock;
 	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
+	struct gnet_stats_basic_cpu __percpu *cpu_bstats_hw;
 	struct gnet_stats_queue __percpu *cpu_qstats;
 	struct tc_cookie	__rcu *act_cookie;
-	struct tcf_chain	*goto_chain;
+	struct tcf_chain	__rcu *goto_chain;
 };
 #define tcf_index	common.tcfa_index
 #define tcf_refcnt	common.tcfa_refcnt
 #define tcf_bindcnt	common.tcfa_bindcnt
-#define tcf_capab	common.tcfa_capab
 #define tcf_action	common.tcfa_action
 #define tcf_tm		common.tcfa_tm
 #define tcf_bstats	common.tcfa_bstats
@@ -81,28 +80,26 @@ static inline void tcf_tm_dump(struct tcf_t *dtm, const struct tcf_t *stm)
 struct tc_action_ops {
 	struct list_head head;
 	char    kind[IFNAMSIZ];
-	__u32   type; /* TBD to match kind */
+	enum tca_id  id; /* identifier should match kind */
 	size_t	size;
 	struct module		*owner;
 	int     (*act)(struct sk_buff *, const struct tc_action *,
 		       struct tcf_result *); /* called under RCU BH lock*/
 	int     (*dump)(struct sk_buff *, struct tc_action *, int, int);
 	void	(*cleanup)(struct tc_action *);
-	int     (*lookup)(struct net *net, struct tc_action **a, u32 index,
-			  struct netlink_ext_ack *extack);
+	int     (*lookup)(struct net *net, struct tc_action **a, u32 index);
 	int     (*init)(struct net *net, struct nlattr *nla,
 			struct nlattr *est, struct tc_action **act, int ovr,
-			int bind, bool rtnl_held,
+			int bind, bool rtnl_held, struct tcf_proto *tp,
 			struct netlink_ext_ack *extack);
 	int     (*walk)(struct net *, struct sk_buff *,
 			struct netlink_callback *, int,
 			const struct tc_action_ops *,
 			struct netlink_ext_ack *);
-	void	(*stats_update)(struct tc_action *, u64, u32, u64);
+	void	(*stats_update)(struct tc_action *, u64, u32, u64, bool);
 	size_t  (*get_fill_size)(const struct tc_action *act);
 	struct net_device *(*get_dev)(const struct tc_action *a);
 	void	(*put_dev)(struct net_device *dev);
-	int     (*delete)(struct net *net, u32 index);
 };
 
 struct tc_action_net {
@@ -120,7 +117,7 @@ int tc_action_net_init(struct tc_action_net *tn,
 	if (!tn->idrinfo)
 		return -ENOMEM;
 	tn->ops = ops;
-	spin_lock_init(&tn->idrinfo->lock);
+	mutex_init(&tn->idrinfo->lock);
 	idr_init(&tn->idrinfo->action_idr);
 	return err;
 }
@@ -148,8 +145,6 @@ int tcf_generic_walker(struct tc_action_net *tn, struct sk_buff *skb,
 		       const struct tc_action_ops *ops,
 		       struct netlink_ext_ack *extack);
 int tcf_idr_search(struct tc_action_net *tn, struct tc_action **a, u32 index);
-bool tcf_idr_check(struct tc_action_net *tn, u32 index, struct tc_action **a,
-		    int bind);
 int tcf_idr_create(struct tc_action_net *tn, u32 index, struct nlattr *est,
 		   struct tc_action **a, const struct tc_action_ops *ops,
 		   int bind, bool cpustats);
@@ -158,7 +153,6 @@ void tcf_idr_insert(struct tc_action_net *tn, struct tc_action *a);
 void tcf_idr_cleanup(struct tc_action_net *tn, u32 index);
 int tcf_idr_check_alloc(struct tc_action_net *tn, u32 *index,
 			struct tc_action **a, int bind);
-int tcf_idr_delete_index(struct tc_action_net *tn, u32 index);
 int __tcf_idr_release(struct tc_action *a, bool bind, bool strict);
 
 static inline int tcf_idr_release(struct tc_action *a, bool bind)
@@ -187,48 +181,23 @@ int tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int, int);
 int tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int, int);
 int tcf_action_copy_stats(struct sk_buff *, struct tc_action *, int);
 
+int tcf_action_check_ctrlact(int action, struct tcf_proto *tp,
+			     struct tcf_chain **handle,
+			     struct netlink_ext_ack *newchain);
+struct tcf_chain *tcf_action_set_ctrlact(struct tc_action *a, int action,
+					 struct tcf_chain *newchain);
 #endif /* CONFIG_NET_CLS_ACT */
 
 static inline void tcf_action_stats_update(struct tc_action *a, u64 bytes,
-					   u64 packets, u64 lastuse)
+					   u64 packets, u64 lastuse, bool hw)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	if (!a->ops->stats_update)
 		return;
 
-	a->ops->stats_update(a, bytes, packets, lastuse);
+	a->ops->stats_update(a, bytes, packets, lastuse, hw);
 #endif
 }
 
-#ifdef CONFIG_NET_CLS_ACT
-int tc_setup_cb_egdev_register(const struct net_device *dev,
-			       tc_setup_cb_t *cb, void *cb_priv);
-void tc_setup_cb_egdev_unregister(const struct net_device *dev,
-				  tc_setup_cb_t *cb, void *cb_priv);
-int tc_setup_cb_egdev_call(const struct net_device *dev,
-			   enum tc_setup_type type, void *type_data,
-			   bool err_stop);
-#else
-static inline
-int tc_setup_cb_egdev_register(const struct net_device *dev,
-			       tc_setup_cb_t *cb, void *cb_priv)
-{
-	return 0;
-}
-
-static inline
-void tc_setup_cb_egdev_unregister(const struct net_device *dev,
-				  tc_setup_cb_t *cb, void *cb_priv)
-{
-}
-
-static inline
-int tc_setup_cb_egdev_call(const struct net_device *dev,
-			   enum tc_setup_type type, void *type_data,
-			   bool err_stop)
-{
-	return 0;
-}
-#endif
 
 #endif

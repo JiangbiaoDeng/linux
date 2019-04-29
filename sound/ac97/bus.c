@@ -84,7 +84,7 @@ ac97_of_get_child_device(struct ac97_controller *ac97_ctrl, int idx,
 		if ((idx != of_property_read_u32(node, "reg", &reg)) ||
 		    !of_device_is_compatible(node, compat))
 			continue;
-		return of_node_get(node);
+		return node;
 	}
 
 	return NULL;
@@ -529,13 +529,15 @@ static int ac97_bus_remove(struct device *dev)
 	int ret;
 
 	ret = pm_runtime_get_sync(dev);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	ret = adrv->remove(adev);
 	pm_runtime_put_noidle(dev);
 	if (ret == 0)
 		ac97_put_disable_clk(adev);
+
+	pm_runtime_disable(dev);
 
 	return ret;
 }

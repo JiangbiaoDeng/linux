@@ -30,6 +30,7 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
+#include <linux/nospec.h>
 #include <sound/rawmidi.h>
 #include <sound/info.h>
 #include <sound/control.h>
@@ -129,7 +130,7 @@ static int snd_rawmidi_runtime_create(struct snd_rawmidi_substream *substream)
 		runtime->avail = 0;
 	else
 		runtime->avail = runtime->buffer_size;
-	runtime->buffer = kvmalloc(runtime->buffer_size, GFP_KERNEL);
+	runtime->buffer = kvzalloc(runtime->buffer_size, GFP_KERNEL);
 	if (!runtime->buffer) {
 		kfree(runtime);
 		return -ENOMEM;
@@ -601,6 +602,7 @@ static int __snd_rawmidi_info_select(struct snd_card *card,
 		return -ENXIO;
 	if (info->stream < 0 || info->stream > 1)
 		return -EINVAL;
+	info->stream = array_index_nospec(info->stream, 2);
 	pstr = &rmidi->streams[info->stream];
 	if (pstr->substream_count == 0)
 		return -ENOENT;
@@ -655,7 +657,7 @@ static int resize_runtime_buffer(struct snd_rawmidi_runtime *runtime,
 	if (params->avail_min < 1 || params->avail_min > params->buffer_size)
 		return -EINVAL;
 	if (params->buffer_size != runtime->buffer_size) {
-		newbuf = kvmalloc(params->buffer_size, GFP_KERNEL);
+		newbuf = kvzalloc(params->buffer_size, GFP_KERNEL);
 		if (!newbuf)
 			return -ENOMEM;
 		spin_lock_irq(&runtime->lock);
@@ -1235,6 +1237,28 @@ int snd_rawmidi_transmit(struct snd_rawmidi_substream *substream,
 	return result;
 }
 EXPORT_SYMBOL(snd_rawmidi_transmit);
+
+/**
+ * snd_rawmidi_proceed - Discard the all pending bytes and proceed
+ * @substream: rawmidi substream
+ *
+ * Return: the number of discarded bytes
+ */
+int snd_rawmidi_proceed(struct snd_rawmidi_substream *substream)
+{
+	struct snd_rawmidi_runtime *runtime = substream->runtime;
+	unsigned long flags;
+	int count = 0;
+
+	spin_lock_irqsave(&runtime->lock, flags);
+	if (runtime->avail < runtime->buffer_size) {
+		count = runtime->buffer_size - runtime->avail;
+		__snd_rawmidi_transmit_ack(substream, count);
+	}
+	spin_unlock_irqrestore(&runtime->lock, flags);
+	return count;
+}
+EXPORT_SYMBOL(snd_rawmidi_proceed);
 
 static long snd_rawmidi_kernel_write1(struct snd_rawmidi_substream *substream,
 				      const unsigned char __user *userbuf,

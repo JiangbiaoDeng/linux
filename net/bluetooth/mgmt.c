@@ -474,7 +474,6 @@ static int read_ext_index_list(struct sock *sk, struct hci_dev *hdev,
 {
 	struct mgmt_rp_read_ext_index_list *rp;
 	struct hci_dev *d;
-	size_t rp_len;
 	u16 count;
 	int err;
 
@@ -488,8 +487,7 @@ static int read_ext_index_list(struct sock *sk, struct hci_dev *hdev,
 			count++;
 	}
 
-	rp_len = sizeof(*rp) + (sizeof(rp->entry[0]) * count);
-	rp = kmalloc(rp_len, GFP_ATOMIC);
+	rp = kmalloc(struct_size(rp, entry, count), GFP_ATOMIC);
 	if (!rp) {
 		read_unlock(&hci_dev_list_lock);
 		return -ENOMEM;
@@ -525,7 +523,6 @@ static int read_ext_index_list(struct sock *sk, struct hci_dev *hdev,
 	}
 
 	rp->num_controllers = cpu_to_le16(count);
-	rp_len = sizeof(*rp) + (sizeof(rp->entry[0]) * count);
 
 	read_unlock(&hci_dev_list_lock);
 
@@ -538,7 +535,8 @@ static int read_ext_index_list(struct sock *sk, struct hci_dev *hdev,
 	hci_sock_clear_flag(sk, HCI_MGMT_UNCONF_INDEX_EVENTS);
 
 	err = mgmt_cmd_complete(sk, MGMT_INDEX_NONE,
-				MGMT_OP_READ_EXT_INDEX_LIST, 0, rp, rp_len);
+				MGMT_OP_READ_EXT_INDEX_LIST, 0, rp,
+				struct_size(rp, entry, count));
 
 	kfree(rp);
 
@@ -551,7 +549,8 @@ static bool is_configured(struct hci_dev *hdev)
 	    !hci_dev_test_flag(hdev, HCI_EXT_CONFIGURED))
 		return false;
 
-	if (test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks) &&
+	if ((test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks) ||
+	     test_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks)) &&
 	    !bacmp(&hdev->public_addr, BDADDR_ANY))
 		return false;
 
@@ -566,7 +565,8 @@ static __le32 get_missing_options(struct hci_dev *hdev)
 	    !hci_dev_test_flag(hdev, HCI_EXT_CONFIGURED))
 		options |= MGMT_OPTION_EXTERNAL_CONFIG;
 
-	if (test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks) &&
+	if ((test_bit(HCI_QUIRK_INVALID_BDADDR, &hdev->quirks) ||
+	     test_bit(HCI_QUIRK_USE_BDADDR_PROPERTY, &hdev->quirks)) &&
 	    !bacmp(&hdev->public_addr, BDADDR_ANY))
 		options |= MGMT_OPTION_PUBLIC_ADDRESS;
 
@@ -2434,9 +2434,8 @@ static int unpair_device(struct sock *sk, struct hci_dev *hdev, void *data,
 	/* LE address type */
 	addr_type = le_addr_type(cp->addr.type);
 
-	hci_remove_irk(hdev, &cp->addr.bdaddr, addr_type);
-
-	err = hci_remove_ltk(hdev, &cp->addr.bdaddr, addr_type);
+	/* Abort any ongoing SMP pairing. Removes ltk and irk if they exist. */
+	err = smp_cancel_and_remove_pairing(hdev, &cp->addr.bdaddr, addr_type);
 	if (err < 0) {
 		err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_UNPAIR_DEVICE,
 					MGMT_STATUS_NOT_PAIRED, &rp,
@@ -2450,8 +2449,6 @@ static int unpair_device(struct sock *sk, struct hci_dev *hdev, void *data,
 		goto done;
 	}
 
-	/* Abort any ongoing SMP pairing */
-	smp_cancel_pairing(conn);
 
 	/* Defer clearing up the connection parameters until closing to
 	 * give a chance of keeping them if a repairing happens.
